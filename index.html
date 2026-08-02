@@ -374,6 +374,7 @@
   let customRangeTo = null;
   let txnFilterState = { query: "", from: "", to: "", year: "", month: "" };
   let snapFilterState = { query: "", from: "", to: "", year: "", month: "" };
+  let depFilterState = { query: "", from: "", to: "", year: "", month: "" };
   let editingRuleId = null; // gesetzt waehrend ein bestehender Dauerauftrag bearbeitet wird
 
   // Berechnet [von, bis] (ISO-Datumsstrings) fuer die Plotly xaxis.range je nach gewaehltem Zeitraum.
@@ -722,6 +723,37 @@
     }
   }
 
+  // Verarbeitet einen Aktien-/ETF-Verkauf: spiegelbildlich zu processTransfer(Kauf per
+  // Einzahlung) - verbucht den Nettoerloes als negative "Einzahlung" mit Ziel-ISIN im Depot
+  // (dadurch reduziert computeTodaySnapshot() die hochgerechnete Stueckzahl dieser Position
+  // automatisch, genau wie eine positive Einzahlung sie erhoeht) und schreibt den Erloes
+  // dem gewaehlten Konto gut. Bewusst NICHT ueber den manuelle-Position-Mechanismus (das
+  // wuerde die Stueckzahl doppelt reduzieren, da beide Wege in die Hochrechnung einfliessen).
+  // Gewinn/Verlust und Gebuehren sind reine Notiz-/Merkfelder (keine automatische
+  // Steuer-/Kostenbasis-Berechnung, da die Datenlage dafuer nicht reicht).
+  function processSale(depotKey, isin, posLabel, shares, price, fee, gain, date, targetAccountId, note) {
+    const brutto = shares * price;
+    const netto = brutto - fee;
+    const txnId = uid();
+
+    const deposits = loadDeposits(depotKey);
+    deposits.push({
+      id: "sale-" + txnId, date, amount: -netto,
+      note: note || `Verkauf: ${posLabel}`, isin: isin || null,
+    });
+    saveDeposits(depotKey, deposits);
+
+    const detailParts = [];
+    if (!isNaN(gain)) detailParts.push(`${gain >= 0 ? "Gewinn" : "Verlust"}: ${fmtEur(Math.abs(gain))}`);
+    if (fee) detailParts.push(`Gebühren: ${fmtEur(fee)}`);
+    const detailNote = detailParts.length ? ` (${detailParts.join(" · ")})` : "";
+    addAccountTransaction(targetAccountId, {
+      id: "sale-acc-" + txnId, date, amount: netto, type: "invest_in", category: "Depot-Verkauf",
+      note: `Verkauf: ${posLabel}, ${shares.toLocaleString("de-DE", { maximumFractionDigits: 6 })} Stück${detailNote}${note ? " · " + note : ""}`,
+      link: { depot: depotKey, isin: isin || null },
+    });
+  }
+
   // Korrigiert einzelne (nicht doppelte) Dauerauftrags-Buchungen, deren Datum durch den
   // fruehreren Zeitzonen-Bug einen Kalendertag zu frueh gespeichert wurde (z.B. Regel auf
   // Tag 1 gestellt, aber am 30./31. abgebucht statt am 1.). Der alte Bug hat das Datum
@@ -911,6 +943,7 @@
     const fixed = {}; FIXED_EXPENSE_CATEGORIES.forEach((c) => { fixed[c] = new Array(12).fill(0); });
     const variable = {}; VARIABLE_EXPENSE_CATEGORIES.forEach((c) => { variable[c] = new Array(12).fill(0); });
     const depotInvest = new Array(12).fill(0);
+    const depotSale = new Array(12).fill(0);
 
     for (const accId of Object.keys(ACCOUNTS)) {
       for (const t of loadAccountTransactions(accId)) {
@@ -925,10 +958,12 @@
           if (FIXED_EXPENSE_CATEGORIES.includes(cat)) fixed[cat][m] += amt; else variable[cat][m] += amt;
         } else if (t.type === "invest_out") {
           depotInvest[m] += Math.abs(t.amount);
+        } else if (t.type === "invest_in") {
+          depotSale[m] += Math.abs(t.amount);
         }
       }
     }
-    return { income, fixed, variable, depotInvest };
+    return { income, fixed, variable, depotInvest, depotSale };
   }
 
   function sumRow(row) { return row.reduce((a, b) => a + b, 0); }
@@ -1016,6 +1051,8 @@
       itemRow(cat, data.income[cat]);
       for (let m = 0; m < 12; m++) incomeRowTotals[m] += data.income[cat][m];
     }
+    itemRow("Depot-Verkäufe", data.depotSale);
+    for (let m = 0; m < 12; m++) incomeRowTotals[m] += data.depotSale[m];
     const incomeGrandTotal = sumRow(incomeRowTotals);
     totalRow("Gesamte Einnahmen", incomeRowTotals, incomeGrandTotal, COLOR.income);
     r += 1;
@@ -2383,7 +2420,7 @@
     const catBreakdown = Object.entries(catTotals).map(([label, amount]) => ({ label, amount })).sort((a, b) => b.amount - a.amount);
 
     // ---- Buchungen-Tabelle ----
-    const typeLabel = { expense: "Ausgabe", income: "Einnahme", transfer_out: "Umbuchung →", transfer_in: "Umbuchung ←", invest_out: "Depot-Einzahlung →" };
+    const typeLabel = { expense: "Ausgabe", income: "Einnahme", transfer_out: "Umbuchung →", transfer_in: "Umbuchung ←", invest_out: "Depot-Einzahlung →", invest_in: "Depot-Verkauf ←" };
     const txnRows = [...txns].sort((a, b) => b.date.localeCompare(a.date)).map((t) => {
       const searchText = [isoToDisplay(t.date), fmtEur(t.amount), typeLabel[t.type] || t.type, t.category || "", t.note || ""].join(" ").toLowerCase();
       return `
@@ -2884,14 +2921,19 @@
     // ---- Deposits table ----
     const nameByIsinAll = {};
     for (const snap of snapshots) for (const p of snap.positions) nameByIsinAll[p.ISIN] = p.Bezeichnung;
-    const depositRows = [...deposits].reverse().map((d) => `
-      <tr>
+    const depYears = Array.from(new Set(deposits.map((d) => d.date.slice(0, 4)))).sort().reverse();
+    const depositRows = [...deposits].reverse().map((d) => {
+      const targetLabel = d.isin ? (nameByIsinAll[d.isin] || d.isin) : "Portfolio (anteilig)";
+      const searchText = [isoToDisplay(d.date), fmtEur(d.amount), targetLabel, d.note || ""].join(" ").toLowerCase();
+      return `
+      <tr data-date="${d.date}" data-search="${searchText.replace(/"/g, "&quot;")}">
         <td>${isoToDisplay(d.date)}</td>
         <td class="num">${fmtEur(d.amount)}</td>
-        <td>${d.isin ? (nameByIsinAll[d.isin] || d.isin) : "Portfolio (anteilig)"}</td>
+        <td>${targetLabel}</td>
         <td>${d.note || ""}</td>
         <td style="text-align:right"><button class="del-btn" data-del-dep="${d.id}" title="Löschen">🗑</button></td>
-      </tr>`).join("");
+      </tr>`;
+    }).join("");
 
     // ---- Snapshot management rows (nicht relevant/nicht gerendert bei combined) ----
     const snapshotByIso = {};
@@ -2911,15 +2953,33 @@
       </tr>`;
     }).join("");
 
+    // ---- Investierter Betrag je Position: Einzahlungen mit festem Ziel-ETF zaehlen voll,
+    // Einzahlungen "Gesamtes Portfolio (anteilig)" (isin=null) werden nach der HEUTIGEN
+    // Portfolio-Gewichtung verteilt - eine einfache Naeherung, keine exakte historische
+    // Zuordnung (die wuerde die Portfoliogewichtung zum jeweiligen Einzahlungszeitpunkt
+    // benoetigen).
+    const investedByIsin = {};
+    for (const d of deposits) {
+      if (d.isin) {
+        investedByIsin[d.isin] = (investedByIsin[d.isin] || 0) + d.amount;
+      } else if (totalNow) {
+        for (const p of latestSorted) {
+          investedByIsin[p.ISIN] = (investedByIsin[p.ISIN] || 0) + d.amount * (p.Kurswert / totalNow);
+        }
+      }
+    }
+
     // ---- Position table rows ----
     const posRows = latestSorted.map((r) => {
       const weight = totalNow ? (r.Kurswert / totalNow) * 100 : 0;
       const color = colorByIsin[r.ISIN];
+      const invested = investedByIsin[r.ISIN] || 0;
       return `<tr>
         <td><span class="dot" style="background:${color}"></span>${r.Bezeichnung}</td>
         <td class="mono">${r.ISIN}</td>
         <td class="num">${r.Stueck.toLocaleString("de-DE", { maximumFractionDigits: 4 })}</td>
         <td class="num">${fmtEur(r.Kurswert)}</td>
+        <td class="num">${fmtEur(invested)}</td>
         <td class="num">${weight.toFixed(1)} %</td>
       </tr>`;
     }).join("");
@@ -3015,7 +3075,7 @@
         <div class="card">
           <h2>Positionen (Stand ${isoToDisplay(latest.date)}${todaySnap ? " <span class=\"est-badge\">aktualisiert</span>" : ""})</h2>
           <div class="table-wrap"><table>
-            <thead><tr><th>Wertpapier</th><th>ISIN</th><th class="num">Stück</th><th class="num">Kurswert</th><th class="num">Gewichtung</th></tr></thead>
+            <thead><tr><th>Wertpapier</th><th>ISIN</th><th class="num">Stück</th><th class="num">Kurswert</th><th class="num" title="Aus zweckgebundenen Einzahlungen + anteilig verteilten Einzahlungen ohne festes Ziel-ETF (nach heutiger Gewichtung, Näherung)">Investiert</th><th class="num">Gewichtung</th></tr></thead>
             <tbody>${posRows}</tbody>
           </table></div>
           <div class="note">
@@ -3107,6 +3167,33 @@
         </div>
 
         <div class="card">
+          <h2>Position verkaufen <span class="sub-h2">– bucht den Erlös automatisch auf ein Konto</span></h2>
+          <div class="deposit-form">
+            <div class="field"><label>Position</label>
+              <select id="sellIsin">
+                <option value="">– auswählen –</option>
+                ${latestSorted.map((p) => `<option value="${p.ISIN}">${p.Bezeichnung} (${p.ISIN})</option>`).join("")}
+              </select>
+            </div>
+            <div class="field"><label>Datum</label><input type="date" id="sellDate" value="${todayIsoLocal()}"></div>
+            <div class="field"><label>Stück</label><input type="number" id="sellShares" step="0.000001" min="0" placeholder="z.B. 5"></div>
+            <div class="field"><label>Verkaufskurs (€ je Stück)</label><input type="number" id="sellPrice" step="0.01" min="0" placeholder="z.B. 95,20"></div>
+            <div class="field"><label>Gebühren (€)</label><input type="number" id="sellFee" step="0.01" min="0" placeholder="0"></div>
+            <div class="field"><label>Gewinn/Verlust (€, optional)</label><input type="number" id="sellGain" step="0.01" placeholder="z.B. 120 oder -30"></div>
+            <div class="field"><label>Erlös gutschreiben auf</label>
+              <select id="sellTargetAcc">
+                ${Object.keys(ACCOUNTS).map((k) => `<option value="${k}" ${k === (currentDepot === "tr" ? "acc_tr_giro" : "acc_ing_giro") ? "selected" : ""}>${ACCOUNTS[k].icon} ${ACCOUNTS[k].label}</option>`).join("")}
+              </select>
+            </div>
+            <div class="field"><label>Notiz (optional)</label><input type="text" id="sellNote" placeholder="z.B. Teilverkauf"></div>
+            <button class="btn primary" id="sellPosBtn">💸 Verkauf verbuchen</button>
+          </div>
+          <div class="note">Reduziert die Stückzahl der Position (bei Komplettverkauf auf 0) und schreibt den
+          Nettoerlös (Verkaufskurs × Stück − Gebühren) dem gewählten Konto als Einnahme gut. Gewinn/Verlust und
+          Gebühren werden nur als Notiz in der Kontobuchung festgehalten (keine automatische Steuerberechnung).</div>
+        </div>
+
+        <div class="card">
           <h2>Einzahlungen verwalten</h2>
           <div class="deposit-form">
             <div class="field"><label>Datum</label><input type="date" id="depDate"></div>
@@ -3124,7 +3211,28 @@
           einzelner Kauf) – dann wird sie in der Hochrechnung vollständig diesem ETF zugerechnet. Ohne Auswahl wird
           sie anteilig nach der aktuellen Portfolio-Aufteilung investiert (z. B. für einen breiten Sparplan über
           alle Positionen).</div>
-          ${deposits.length ? `<div class="table-wrap"><table>
+          ${deposits.length ? `
+          <div class="txn-filter-bar">
+            <div class="txn-filter-quick">
+              <select id="depFilterYear" title="Jahr">
+                <option value="">Alle Jahre</option>
+                ${depYears.map((y) => `<option value="${y}" ${depFilterState.year === y ? "selected" : ""}>${y}</option>`).join("")}
+              </select>
+              <select id="depFilterMonth" title="Monat">
+                <option value="">Alle Monate</option>
+                ${MONTH_NAMES.map((name, i) => { const mm = String(i + 1).padStart(2, "0"); return `<option value="${mm}" ${depFilterState.month === mm ? "selected" : ""}>${name}</option>`; }).join("")}
+              </select>
+            </div>
+            <input type="text" id="depSearch" placeholder="🔍 Suche (Ziel-ETF, Notiz, Betrag) …" value="${depFilterState.query.replace(/"/g, "&quot;")}">
+            <div class="txn-filter-dates">
+              <input type="date" id="depFilterFrom" value="${depFilterState.from}" title="Von">
+              <span>–</span>
+              <input type="date" id="depFilterTo" value="${depFilterState.to}" title="Bis">
+            </div>
+            <button class="btn" id="depFilterReset">Zurücksetzen</button>
+            <span id="depFilterCount" class="sub-h2"></span>
+          </div>
+          <div class="table-wrap table-wrap-scroll"><table id="depTable">
             <thead><tr><th>Datum</th><th class="num">Betrag</th><th>Ziel-ETF</th><th>Notiz</th><th></th></tr></thead>
             <tbody>${depositRows}</tbody>
           </table></div>` : `<div class="empty" style="padding:16px">Noch keine Einzahlungen eingetragen.</div>`}
@@ -3403,6 +3511,62 @@
       applySnapFilter();
     }
 
+    // ---- Einzahlungen filtern/durchsuchen (analog zur Buchungen-/Stichtage-Filterleiste) ----
+    function applyDepFilter() {
+      const table = document.getElementById("depTable");
+      if (!table) return;
+      const query = depFilterState.query.toLowerCase().trim();
+      const from = depFilterState.from;
+      const to = depFilterState.to;
+      let visible = 0, total = 0;
+      table.querySelectorAll("tbody tr").forEach((row) => {
+        total++;
+        const date = row.getAttribute("data-date") || "";
+        const search = row.getAttribute("data-search") || "";
+        const match = (!query || search.includes(query)) && (!from || date >= from) && (!to || date <= to);
+        row.style.display = match ? "" : "none";
+        if (match) visible++;
+      });
+      const countEl = document.getElementById("depFilterCount");
+      if (countEl) countEl.textContent = (query || from || to) ? `${visible} von ${total} Einzahlungen` : `${total} Einzahlung(en)`;
+    }
+    const depSearchEl = document.getElementById("depSearch");
+    const depFilterFromEl = document.getElementById("depFilterFrom");
+    const depFilterToEl = document.getElementById("depFilterTo");
+    const depFilterResetEl = document.getElementById("depFilterReset");
+    const depFilterYearEl = document.getElementById("depFilterYear");
+    const depFilterMonthEl = document.getElementById("depFilterMonth");
+    function applyDepYearMonthQuickFilter() {
+      const year = depFilterYearEl.value;
+      const month = depFilterMonthEl.value;
+      depFilterState.year = year;
+      depFilterState.month = month;
+      if (!year) {
+        depFilterState.from = ""; depFilterState.to = "";
+      } else if (!month) {
+        depFilterState.from = `${year}-01-01`; depFilterState.to = `${year}-12-31`;
+      } else {
+        const lastDay = new Date(Number(year), Number(month), 0).getDate();
+        depFilterState.from = `${year}-${month}-01`; depFilterState.to = `${year}-${month}-${String(lastDay).padStart(2, "0")}`;
+      }
+      depFilterFromEl.value = depFilterState.from; depFilterToEl.value = depFilterState.to;
+      applyDepFilter();
+    }
+    if (depSearchEl) {
+      depSearchEl.addEventListener("input", () => { depFilterState.query = depSearchEl.value; applyDepFilter(); });
+      depFilterFromEl.addEventListener("change", () => { depFilterState.from = depFilterFromEl.value; depFilterState.year = ""; depFilterState.month = ""; depFilterYearEl.value = ""; depFilterMonthEl.value = ""; applyDepFilter(); });
+      depFilterToEl.addEventListener("change", () => { depFilterState.to = depFilterToEl.value; depFilterState.year = ""; depFilterState.month = ""; depFilterYearEl.value = ""; depFilterMonthEl.value = ""; applyDepFilter(); });
+      depFilterYearEl.addEventListener("change", applyDepYearMonthQuickFilter);
+      depFilterMonthEl.addEventListener("change", applyDepYearMonthQuickFilter);
+      depFilterResetEl.addEventListener("click", () => {
+        depFilterState = { query: "", from: "", to: "", year: "", month: "" };
+        depSearchEl.value = ""; depFilterFromEl.value = ""; depFilterToEl.value = "";
+        depFilterYearEl.value = ""; depFilterMonthEl.value = "";
+        applyDepFilter();
+      });
+      applyDepFilter();
+    }
+
     const resetBtn = document.getElementById("resetAll");
     if (resetBtn) {
       resetBtn.addEventListener("click", () => {
@@ -3472,6 +3636,32 @@
         renderDashboard();
       });
     });
+    const sellPosBtn = document.getElementById("sellPosBtn");
+    if (sellPosBtn) {
+      sellPosBtn.addEventListener("click", () => {
+        const isin = document.getElementById("sellIsin").value;
+        const date = document.getElementById("sellDate").value;
+        const shares = parseFloat(document.getElementById("sellShares").value);
+        const price = parseFloat(document.getElementById("sellPrice").value);
+        const fee = parseFloat(document.getElementById("sellFee").value) || 0;
+        const gainRaw = document.getElementById("sellGain").value.trim();
+        const gain = gainRaw === "" ? NaN : parseFloat(gainRaw);
+        const targetAcc = document.getElementById("sellTargetAcc").value;
+        const note = document.getElementById("sellNote").value.trim();
+        if (!isin || !date || !shares || shares <= 0 || !price || price <= 0 || !targetAcc) {
+          alert("Bitte Position, Datum, Stück, Verkaufskurs und Zielkonto angeben.");
+          return;
+        }
+        const pos = latestSorted.find((p) => p.ISIN === isin);
+        const heldShares = pos ? pos.Stueck : Infinity;
+        if (shares > heldShares + 1e-9) {
+          alert(`Es sind nur ${heldShares.toLocaleString("de-DE", { maximumFractionDigits: 6 })} Stück im Depot vorhanden.`);
+          return;
+        }
+        processSale(currentDepot, isin, pos ? pos.Bezeichnung : isin, shares, price, fee, gain, date, targetAcc, note);
+        renderDashboard();
+      });
+    }
 
     // ---- Dropzone (jetzt Teil des Data-Tabs, bei jedem Render neu verknuepft) ----
     const dropzoneEl = document.getElementById("dropzone");
