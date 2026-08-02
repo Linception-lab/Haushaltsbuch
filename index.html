@@ -451,24 +451,11 @@
     "IE00B4X9L533": MSCI_WORLD_SECTORS, "IE00BFY0GT14": MSCI_WORLD_SECTORS,
     "LU1781541179": MSCI_WORLD_SECTORS,
     "IE00BKM4GZ66": MSCI_EM_SECTORS,
-    // Trade-Republic-Einzeltitel: manuell recherchierte Naeherung (Einzelaktien = 100% ein Land/Sektor,
-    // Themenfonds/Hebelprodukte/Krypto bleiben unklassifiziert, da keine sinnvolle Einzel-Zuordnung moeglich)
-    "AU000000ARU5": { "Grundstoffe": 100 },                 // Arafura Resources (Australien)
-    "US1347481020": { "Technologie": 100 },                 // Canaan ADR (China, Mining-Hardware)
-    "CA80280U2056": { "Grundstoffe": 100 },                  // Santacruz Silver Mining (Kanada)
-    "CA44888L1085": { "Grundstoffe": 100 },                  // HydroGraph Clean Power (Kanada)
-    "US7731211089": { "Industrie": 100 },                    // Rocket Lab (USA)
-    "US0079031078": { "Technologie": 100 },                  // AMD (USA)
+    // Einzeltitel (z.B. Trade-Republic-Einzelaktien) sind hier bewusst NICHT hinterlegt - das
+    // wuerde verraten, welche konkreten Wertpapiere gehalten werden. Stattdessen kann jede:r
+    // Nutzer:in eigene Zuordnungen ueber "ISIN-Zuordnungen verwalten" in der App eintragen;
+    // die landen nur in buildIsinOverrideWeightMaps() / localStorage, nie im Programmcode.
   };
-  const REGION_WEIGHTS_TR_EXTRA = {
-    "AU000000ARU5": { "Asien-Pazifik (ex Japan)": 100 },
-    "US1347481020": { "Asien (Schwellenländer)": 100 },
-    "CA80280U2056": { "Nordamerika": 100 },
-    "CA44888L1085": { "Nordamerika": 100 },
-    "US7731211089": { "Nordamerika": 100 },
-    "US0079031078": { "Nordamerika": 100 },
-  };
-  Object.assign(REGION_WEIGHTS_BY_ISIN, REGION_WEIGHTS_TR_EXTRA);
 
   // ============================================================
   // Trade Republic: Seed-Daten aus Transaktionsexport (2021-04-12 bis 2026-07-12)
@@ -480,21 +467,10 @@
   const TR_SEED_DATA = {};
   const TR_DEPOSITS_SEED = [];
   const TR_CURRENT_PRICES_SEED = {};
-  const TR_YAHOO_SYMBOLS = {
-    "US7731211089": "RKLB",              // Rocket Lab (USD)
-    "US0079031078": "AMD",               // AMD (USD)
-    "US1347481020": "CAN",               // Canaan ADR (USD)
-    "AU000000ARU5": "ARU.AX",            // Arafura Rare Earths (AUD, ASX)
-    "CA80280U2056": "SCZ.V",             // Santacruz Silver Mining (CAD, TSXV)
-    "CA44888L1085": "HG.CN",             // HydroGraph Clean Power (CAD, CSE)
-    "ALGO": "ALGO-EUR",                  // Algorand (direkt in EUR)
-    "IE000YU9K6K2": "IE000YU9K6K2.SG",   // VanEck Space Innovators (EUR, Stuttgart)
-    "IE000YDZG487": "IE000YDZG487.SG",   // HSBC Nasdaq Global Semiconductor (EUR, vermutlich Stuttgart)
-    "IE00B8HGT870": "IE00B8HGT870.SG",   // Boost Gold 3x Leverage ETP (EUR, vermutlich Stuttgart)
-  };
-  const TR_STOOQ_SYMBOLS = {
-    "US7731211089": "rklb.us", "US0079031078": "amd.us", "US1347481020": "can.us",
-  };
+  // Trade Republic wird von runLivePriceFetch() bewusst nicht automatisch aktualisiert (siehe
+  // dortiger Kommentar) - diese Maps bleiben daher leer, statt Einzeltitel-Symbole zu verraten.
+  const TR_YAHOO_SYMBOLS = {};
+  const TR_STOOQ_SYMBOLS = {};
   // Waehrungen, die live per Yahoo-FX-Kurs (WAEHRUNGEUR=X) in EUR umgerechnet werden koennen
   const CONVERTIBLE_CURRENCIES = ["USD", "CAD", "AUD", "GBP", "CHF"];
 
@@ -561,6 +537,28 @@
   function seedDepositsAndPricesIfEmpty(depot, depositsSeed, pricesSeed) {
     if (storage.get(depot + ":deposits") === null) saveDeposits(depot, depositsSeed);
     if (storage.get(depot + ":currentPrices") === null) saveCurrentPrices(depot, pricesSeed);
+  }
+
+  // Region-/Branchen-Zuordnung fuer einzelne Wertpapiere (z.B. Einzelaktien), die nicht in den
+  // eingebauten Index-Zusammensetzungen enthalten sind. Bewusst NICHT im Programmcode hinterlegt
+  // (das wuerde verraten, welche Einzeltitel gehalten werden) - bleibt ausschliesslich in diesem
+  // Browser gespeichert. Struktur: { [ISIN]: { region: "...", sector: "..." } }
+  function loadIsinOverrides(depot) {
+    const res = storage.get(depot + ":isinOverrides");
+    if (!res) return {};
+    try { return JSON.parse(res.value); } catch (e) { return {}; }
+  }
+  function saveIsinOverrides(depot, obj) { storage.set(depot + ":isinOverrides", JSON.stringify(obj)); }
+
+  function buildIsinOverrideWeightMaps(depot) {
+    const overrides = loadIsinOverrides(depot);
+    const region = {}, sector = {};
+    for (const isin of Object.keys(overrides)) {
+      const o = overrides[isin];
+      if (o.region) region[isin] = { [o.region]: 100 };
+      if (o.sector) sector[isin] = { [o.sector]: 100 };
+    }
+    return { region, sector };
   }
 
   // ============================================================
@@ -1259,7 +1257,7 @@
     const positions = base.positions.map((p) => {
       const price = currentPrices[p.ISIN] || p.Kurswert / p.Stueck;
       const stueck = stueckByIsin[p.ISIN];
-      return { Bezeichnung: p.Bezeichnung, ISIN: p.ISIN, WKN: p.WKN, Stueck: stueck, Kurswert: stueck * price };
+      return { Bezeichnung: p.Bezeichnung, ISIN: p.ISIN, WKN: p.WKN, Stueck: stueck, Kurswert: stueck * price, Investiert: p.Investiert };
     });
 
     return {
@@ -1277,10 +1275,12 @@
   // Browser-Anfragen (CORS) - daher ueber einen oeffentlichen CORS-Proxy, mit Fallback
   // auf einen zweiten Proxy, falls der erste nicht erreichbar ist. Das ist ein
   // inoffizieller Weg (keine offizielle Yahoo-API) und kann gelegentlich fehlschlagen.
+  // makeUrl baut die Proxy-URL, unwrap liefert aus der Proxy-Antwort den rohen Original-Text
+  // zurueck (manche Proxys geben den Inhalt 1:1 durch, andere verpacken ihn in JSON).
   const CORS_PROXIES = [
-    (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-    (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
-    (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+    { makeUrl: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`, unwrap: (t) => t },
+    { makeUrl: (u) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, unwrap: (t) => JSON.parse(t).contents },
+    { makeUrl: (u) => `https://proxy.cors.sh/${u}`, unwrap: (t) => t },
   ];
   // Freie CORS-Proxys/Kursquellen sind oeffentliche Drittanbieter-Dienste ohne
   // Verfuegbarkeitsgarantie - ein haengender Request wuerde sonst die ganze
@@ -1298,11 +1298,11 @@
   async function fetchYahooPrice(symbol) {
     const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`;
     let lastErr;
-    for (const makeProxyUrl of CORS_PROXIES) {
+    for (const proxy of CORS_PROXIES) {
       try {
-        const res = await fetchWithTimeout(makeProxyUrl(yahooUrl), 6000);
+        const res = await fetchWithTimeout(proxy.makeUrl(yahooUrl), 6000);
         if (!res.ok) throw new Error("HTTP " + res.status);
-        const data = await res.json();
+        const data = JSON.parse(proxy.unwrap(await res.text()));
         const meta = data && data.chart && data.chart.result && data.chart.result[0] && data.chart.result[0].meta;
         if (meta && typeof meta.regularMarketPrice === "number") {
           return { price: meta.regularMarketPrice, currency: meta.currency, time: meta.regularMarketTime, source: "Yahoo Finance" };
@@ -1339,11 +1339,11 @@
         if (parsed) return { ...parsed, currency: "EUR" };
       }
     } catch (e) { /* vermutlich CORS/Netzwerk - via Proxy erneut versuchen */ }
-    for (const makeProxyUrl of CORS_PROXIES) {
+    for (const proxy of CORS_PROXIES) {
       try {
-        const res = await fetchWithTimeout(makeProxyUrl(stooqUrl), 6000);
+        const res = await fetchWithTimeout(proxy.makeUrl(stooqUrl), 6000);
         if (!res.ok) continue;
-        const parsed = parseStooqCsv(await res.text());
+        const parsed = parseStooqCsv(proxy.unwrap(await res.text()));
         if (parsed) return { ...parsed, currency: "EUR" };
       } catch (e) { continue; }
     }
@@ -2094,6 +2094,24 @@
     return type.split("_").map((w) => w.charAt(0) + w.slice(1).toLowerCase()).join(" ");
   }
 
+  // FIFO-Kostenbasis: verbraucht (aelteste zuerst) Lose bis zur verkauften Stueckzahl und
+  // entfernt deren urspruengliche Kosten aus dem investierten Betrag - ein Verkauf reduziert
+  // "investiert" also um die Anschaffungskosten der verkauften Stuecke, nicht um den Erloes.
+  function fifoConsume(lots, sellShares) {
+    let remaining = sellShares;
+    while (remaining > 1e-9 && lots.length) {
+      const lot = lots[0];
+      if (lot.shares <= remaining + 1e-9) {
+        remaining -= lot.shares;
+        lots.shift();
+      } else {
+        lot.cost -= lot.cost * (remaining / lot.shares);
+        lot.shares -= remaining;
+        remaining = 0;
+      }
+    }
+  }
+
   function parseTrTransactionCsv(text) {
     const rows = parseCsvRows(text).filter((r) => r.length > 1);
     if (!rows.length) return null;
@@ -2107,6 +2125,7 @@
     const nameBySymbol = {};
     const priceBySymbol = {};
     const deposits = [];
+    const tradeRows = [];
     let unhandledCorporateActions = 0;
 
     for (let r = 1; r < rows.length; r++) {
@@ -2136,14 +2155,42 @@
         const priceVal = parseFloat(get("price"));
         if (!isNaN(priceVal) && priceVal > 0) priceBySymbol[symbol] = priceVal;
         if (category !== "TRADING") unhandledCorporateActions++;
+
+        const amountVal = parseFloat(get("amount"));
+        const feeVal = parseFloat(get("fee"));
+        tradeRows.push({
+          date, symbol, sharesVal,
+          amount: isNaN(amountVal) ? 0 : amountVal,
+          fee: isNaN(feeVal) ? 0 : feeVal,
+        });
       }
+    }
+
+    // ---- Investierter Betrag je Symbol: FIFO-Kostenbasis der AKTUELL gehaltenen Stuecke,
+    // direkt aus den Kauf/Verkauf-Zeilen (nicht aus generischen Kontobewegungen, die keinen
+    // Bezug zu einer bestimmten Position haben).
+    const lotsBySymbol = {};
+    for (const t of tradeRows.slice().sort((a, b) => a.date.localeCompare(b.date))) {
+      const lots = (lotsBySymbol[t.symbol] = lotsBySymbol[t.symbol] || []);
+      if (t.sharesVal > 0) {
+        lots.push({ shares: t.sharesVal, cost: Math.abs(t.amount) + Math.abs(t.fee) });
+      } else if (t.sharesVal < 0) {
+        fifoConsume(lots, Math.abs(t.sharesVal));
+      }
+    }
+    const investedBySymbol = {};
+    for (const symbol of Object.keys(lotsBySymbol)) {
+      investedBySymbol[symbol] = lotsBySymbol[symbol].reduce((s, l) => s + l.cost, 0);
     }
 
     const positions = Object.keys(sharesBySymbol)
       .map((symbol) => {
         const stueck = sharesBySymbol[symbol];
         const price = priceBySymbol[symbol] || 0;
-        return { Bezeichnung: nameBySymbol[symbol] || symbol, ISIN: symbol, WKN: "", Stueck: stueck, Kurswert: stueck * price };
+        return {
+          Bezeichnung: nameBySymbol[symbol] || symbol, ISIN: symbol, WKN: "", Stueck: stueck, Kurswert: stueck * price,
+          Investiert: investedBySymbol[symbol] || 0,
+        };
       })
       .filter((p) => Math.abs(p.Stueck) > 0.0001);
 
@@ -2973,7 +3020,10 @@
     const posRows = latestSorted.map((r) => {
       const weight = totalNow ? (r.Kurswert / totalNow) * 100 : 0;
       const color = colorByIsin[r.ISIN];
-      const invested = investedByIsin[r.ISIN] || 0;
+      // TR-Positionen bringen ihre eigene, aus den Kauf/Verkauf-Zeilen per FIFO berechnete
+      // Kostenbasis mit (praeziser als die Naeherung ueber Kontobewegungen) - wenn vorhanden,
+      // hat sie Vorrang vor der einzahlungsbasierten Schaetzung.
+      const invested = r.Investiert != null ? r.Investiert : (investedByIsin[r.ISIN] || 0);
       return `<tr>
         <td><span class="dot" style="background:${color}"></span>${r.Bezeichnung}</td>
         <td class="mono">${r.ISIN}</td>
@@ -2991,8 +3041,15 @@
                value="${(currentPrices[p.ISIN] ?? (p.Kurswert / p.Stueck)).toFixed(2)}">
       </div>`).join("");
 
-    const regionBreakdown = computeBlendedBreakdown(latest.positions, REGION_WEIGHTS_BY_ISIN);
-    const sectorBreakdown = computeBlendedBreakdown(latest.positions, SECTOR_WEIGHTS_BY_ISIN);
+    // Eigene (nur lokal gespeicherte) ISIN-Zuordnungen mit den eingebauten Index-Profilen mischen
+    const ownMaps = currentDepot === "combined"
+      ? (() => {
+          const i = buildIsinOverrideWeightMaps("ing"), t = buildIsinOverrideWeightMaps("tr");
+          return { region: { ...i.region, ...t.region }, sector: { ...i.sector, ...t.sector } };
+        })()
+      : buildIsinOverrideWeightMaps(currentDepot);
+    const regionBreakdown = computeBlendedBreakdown(latest.positions, { ...REGION_WEIGHTS_BY_ISIN, ...ownMaps.region });
+    const sectorBreakdown = computeBlendedBreakdown(latest.positions, { ...SECTOR_WEIGHTS_BY_ISIN, ...ownMaps.sector });
 
     let wealthOverviewHtml = "";
     if (currentDepot === "combined") {
@@ -3141,6 +3198,40 @@
           verzögert sein. Ein abgerufener Kurs, der mehr als 40 % vom letzten bekannten Kurs abweicht, wird zur
           Sicherheit <b>nicht</b> automatisch übernommen. Klappt der Abruf nicht, einfach oben manuell eintragen –
           das bleibt immer zuverlässig.`}</div>
+        </div>
+
+        <div class="card">
+          <h2>ISIN-Zuordnungen verwalten <span class="sub-h2">– für Regionen-/Branchengewichtung bei Einzeltiteln</span></h2>
+          <div class="deposit-form">
+            <div class="field"><label>ISIN</label><input type="text" id="isinOvIsin" placeholder="z.B. US0378331005" style="text-transform:uppercase"></div>
+            <div class="field"><label>Region</label>
+              <select id="isinOvRegion">
+                <option value="">– keine –</option>
+                ${Array.from(new Set([...Object.keys(MSCI_WORLD_REGIONS), ...Object.keys(MSCI_EM_REGIONS)])).map((r) => `<option value="${r}">${r}</option>`).join("")}
+              </select>
+            </div>
+            <div class="field"><label>Branche</label>
+              <select id="isinOvSector">
+                <option value="">– keine –</option>
+                ${Object.keys(MSCI_WORLD_SECTORS).map((s) => `<option value="${s}">${s}</option>`).join("")}
+              </select>
+            </div>
+            <button class="btn primary" id="addIsinOvBtn">+ Zuordnung speichern</button>
+          </div>
+          ${(() => {
+            const list = Object.entries(loadIsinOverrides(currentDepot));
+            return list.length ? `<div class="table-wrap"><table>
+            <thead><tr><th>ISIN</th><th>Region</th><th>Branche</th><th></th></tr></thead>
+            <tbody>${list.map(([isin, o]) => `<tr>
+              <td class="mono">${isin}</td><td>${o.region || "–"}</td><td>${o.sector || "–"}</td>
+              <td style="text-align:right"><button class="del-btn" data-del-isinov="${isin}" title="Löschen">🗑</button></td>
+            </tr>`).join("")}</tbody>
+          </table></div>` : `<div class="empty" style="padding:16px">Noch keine eigenen Zuordnungen.</div>`;
+          })()}
+          <div class="note">Nur für die Regionen-/Branchengewichtung im Diagramm – wird ausschließlich in diesem
+          Browser gespeichert (localStorage), nie im Programmcode oder Export. Bereits eingebaut sind die üblichen
+          breiten Welt-/Schwellenländer-ETFs; für Einzelaktien oder Nischen-ETFs kannst du hier selbst eine
+          Näherung (100 % einer Region/Branche) hinterlegen.</div>
         </div>
 
         <div class="card">
@@ -3606,6 +3697,31 @@
         renderDashboard();
       });
     }
+    const addIsinOvBtn = document.getElementById("addIsinOvBtn");
+    if (addIsinOvBtn) {
+      addIsinOvBtn.addEventListener("click", () => {
+        const isin = document.getElementById("isinOvIsin").value.trim().toUpperCase();
+        const region = document.getElementById("isinOvRegion").value;
+        const sector = document.getElementById("isinOvSector").value;
+        if (!isin || (!region && !sector)) {
+          alert("Bitte ISIN und mindestens Region oder Branche angeben.");
+          return;
+        }
+        const overrides = loadIsinOverrides(currentDepot);
+        overrides[isin] = { region: region || undefined, sector: sector || undefined };
+        saveIsinOverrides(currentDepot, overrides);
+        renderDashboard();
+      });
+    }
+    dashboardEl.querySelectorAll("[data-del-isinov]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const isin = btn.getAttribute("data-del-isinov");
+        const overrides = loadIsinOverrides(currentDepot);
+        delete overrides[isin];
+        saveIsinOverrides(currentDepot, overrides);
+        renderDashboard();
+      });
+    });
     const addManualPosBtn = document.getElementById("addManualPosBtn");
     if (addManualPosBtn) {
       addManualPosBtn.addEventListener("click", () => {
