@@ -373,6 +373,7 @@
   let customRangeFrom = null;
   let customRangeTo = null;
   let txnFilterState = { query: "", from: "", to: "", year: "", month: "" };
+  let snapFilterState = { query: "", from: "", to: "", year: "", month: "" };
   let editingRuleId = null; // gesetzt waehrend ein bestehender Dauerauftrag bearbeitet wird
 
   // Berechnet [von, bis] (ISO-Datumsstrings) fuer die Plotly xaxis.range je nach gewaehltem Zeitraum.
@@ -599,11 +600,11 @@
   const DEPOTS = {
     ing: {
       label: "ING DiBa", seedSnapshots: SEED_DATA, seedDeposits: DEPOSITS_SEED, seedPrices: CURRENT_PRICES_SEED,
-      yahooSymbols: YAHOO_SYMBOLS, stooqSymbols: STOOQ_SYMBOLS, supportsPdfUpload: true,
+      yahooSymbols: YAHOO_SYMBOLS, stooqSymbols: STOOQ_SYMBOLS, uploadFormat: "pdf",
     },
     tr: {
       label: "Trade Republic", seedSnapshots: TR_SEED_DATA, seedDeposits: TR_DEPOSITS_SEED, seedPrices: TR_CURRENT_PRICES_SEED,
-      yahooSymbols: TR_YAHOO_SYMBOLS, stooqSymbols: TR_STOOQ_SYMBOLS, supportsPdfUpload: false,
+      yahooSymbols: TR_YAHOO_SYMBOLS, stooqSymbols: TR_STOOQ_SYMBOLS, uploadFormat: "csv",
     },
   };
 
@@ -2021,7 +2022,132 @@
   // ============================================================
   // Datei-Verarbeitung
   // ============================================================
+  // ============================================================
+  // Trade-Republic CSV-Transaktionsexport: Positionen (Depot) und
+  // Kontobewegungen daraus ableiten. "shares"/"amount" sind im Export
+  // bereits vorzeichenrichtig (negativ = Abgang), daher genuegt eine
+  // einfache Kumulierung je Symbol/ISIN ueber alle Zeilen hinweg.
+  // ============================================================
+  function parseCsvRows(text) {
+    const rows = [];
+    let row = [], field = "", inQuotes = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; } else inQuotes = false;
+        } else field += c;
+      } else if (c === '"') {
+        inQuotes = true;
+      } else if (c === ",") {
+        row.push(field); field = "";
+      } else if (c === "\r") {
+        // ignorieren, \n uebernimmt den Zeilenumbruch
+      } else if (c === "\n") {
+        row.push(field); rows.push(row); row = []; field = "";
+      } else {
+        field += c;
+      }
+    }
+    if (field.length || row.length) { row.push(field); rows.push(row); }
+    return rows;
+  }
+
+  function humanizeTrType(type) {
+    return type.split("_").map((w) => w.charAt(0) + w.slice(1).toLowerCase()).join(" ");
+  }
+
+  function parseTrTransactionCsv(text) {
+    const rows = parseCsvRows(text).filter((r) => r.length > 1);
+    if (!rows.length) return null;
+    const header = rows[0].map((h) => h.trim());
+    const idx = {};
+    header.forEach((h, i) => (idx[h] = i));
+    const need = ["date", "category", "type", "name", "symbol", "shares", "price", "amount", "transaction_id"];
+    if (need.some((k) => !(k in idx))) return null;
+
+    const sharesBySymbol = {};
+    const nameBySymbol = {};
+    const priceBySymbol = {};
+    const deposits = [];
+    let unhandledCorporateActions = 0;
+
+    for (let r = 1; r < rows.length; r++) {
+      const cols = rows[r];
+      if (cols.length < header.length) continue;
+      const get = (key) => (cols[idx[key]] || "").trim();
+      const date = get("date");
+      if (!date) continue;
+      const category = get("category");
+      const type = get("type");
+
+      if (category === "CASH") {
+        const amount = parseFloat(get("amount"));
+        if (!isNaN(amount) && amount !== 0) {
+          deposits.push({ date, amount, note: "Trade Republic: " + humanizeTrType(type), id: "tr-" + get("transaction_id") });
+        }
+        continue;
+      }
+
+      if (category === "TRADING" || category === "CORPORATE_ACTION" || category === "DELIVERY") {
+        const symbol = get("symbol");
+        const sharesVal = parseFloat(get("shares"));
+        if (!symbol || isNaN(sharesVal)) continue;
+        sharesBySymbol[symbol] = (sharesBySymbol[symbol] || 0) + sharesVal;
+        const name = get("name");
+        if (name) nameBySymbol[symbol] = name;
+        const priceVal = parseFloat(get("price"));
+        if (!isNaN(priceVal) && priceVal > 0) priceBySymbol[symbol] = priceVal;
+        if (category !== "TRADING") unhandledCorporateActions++;
+      }
+    }
+
+    const positions = Object.keys(sharesBySymbol)
+      .map((symbol) => {
+        const stueck = sharesBySymbol[symbol];
+        const price = priceBySymbol[symbol] || 0;
+        return { Bezeichnung: nameBySymbol[symbol] || symbol, ISIN: symbol, WKN: "", Stueck: stueck, Kurswert: stueck * price };
+      })
+      .filter((p) => Math.abs(p.Stueck) > 0.0001);
+
+    return { positions, deposits, unhandledCorporateActions };
+  }
+
   async function processFile(file) {
+    const depotKey = currentDepot === "combined" ? "ing" : currentDepot;
+    const cfg = DEPOTS[depotKey];
+    const isCsv = file.name.toLowerCase().endsWith(".csv") || file.type === "text/csv";
+
+    if (cfg.uploadFormat === "csv") {
+      if (!isCsv) {
+        logStatus(`✗ ${file.name}: keine CSV-Datei, übersprungen.`, "error");
+        return;
+      }
+      logStatus(`Lese ${file.name} …`, "info");
+      try {
+        const text = await file.text();
+        const result = parseTrTransactionCsv(text);
+        if (!result || !result.positions.length) {
+          logStatus(`⚠ ${file.name}: keine Positionen erkannt. Format evtl. abweichend.`, "warn");
+          return;
+        }
+        const isoDate = todayIsoLocal();
+        saveSnapshot(depotKey, { date: isoDate, dateDisplay: isoToDisplay(isoDate), positions: result.positions, source: file.name + " (CSV-Import)" });
+        if (result.deposits.length) {
+          const existing = loadDeposits(depotKey);
+          const existingIds = new Set(existing.map((x) => x.id));
+          const merged = existing.concat(result.deposits.filter((x) => !existingIds.has(x.id)));
+          saveDeposits(depotKey, merged);
+        }
+        const caNote = result.unhandledCorporateActions ? ` · ${result.unhandledCorporateActions} Kapitalmaßnahme(n) automatisch verarbeitet (bitte Bestand prüfen)` : "";
+        logStatus(`✓ ${file.name}: ${result.positions.length} Position(en), ${result.deposits.length} Kontobewegung(en) verarbeitet${caNote}`, "success");
+      } catch (err) {
+        console.error(err);
+        logStatus(`✗ ${file.name}: Fehler beim Verarbeiten (${err.message || err})`, "error");
+      }
+      return;
+    }
+
     if (!file.name.toLowerCase().endsWith(".pdf") && file.type !== "application/pdf") {
       logStatus(`✗ ${file.name}: keine PDF-Datei, übersprungen.`, "error");
       return;
@@ -2047,7 +2173,7 @@
         if (diff < 0.01) matchNote = " · Summe stimmt überein ✓";
         else { matchNote = ` · ⚠ Abweichung: erkannt ${totalErkannt.toFixed(2)} € vs. PDF ${gesamtPdf.toFixed(2)} €`; level = "warn"; }
       }
-      saveSnapshot(currentDepot === "combined" ? "ing" : currentDepot, { date: isoDate, dateDisplay: dateStr || isoToDisplay(isoDate), positions: rows, source: file.name });
+      saveSnapshot(depotKey, { date: isoDate, dateDisplay: dateStr || isoToDisplay(isoDate), positions: rows, source: file.name });
       logStatus(`✓ ${file.name}: Stichtag ${dateStr || isoToDisplay(isoDate)}, ${rows.length} Position(en)${matchNote}`, level);
     } catch (err) {
       console.error(err);
@@ -2123,7 +2249,7 @@
     const latest = combinedSnapshots.length ? combinedSnapshots[combinedSnapshots.length - 1] : null;
     const first = combinedSnapshots.length ? combinedSnapshots[0] : null;
     return {
-      depot: "combined", cfg: { label: "Gesamtübersicht", supportsPdfUpload: false },
+      depot: "combined", cfg: { label: "Gesamtübersicht", uploadFormat: null },
       snapshotsObj: null, isoDates: allDates, deposits, realSnapshots: combinedSnapshots, currentPrices: {},
       todaySnap: null, snapshots: combinedSnapshots, latest, first, latestReal: latest,
       _ing: ing, _tr: tr,
@@ -2688,7 +2814,31 @@
 
     if (!latest) {
       headerSub.textContent = "Läuft komplett lokal in deinem Browser – keine Cloud, kein Account nötig.";
-      dashboardEl.innerHTML = `<div class="card"><div class="empty">Noch keine Daten für ${cfg.label} vorhanden.${cfg.supportsPdfUpload ? " Lade im Reiter \"Einzahlungen & Rohdaten\" deine erste PDF hoch." : ""}</div></div>`;
+      dashboardEl.innerHTML = `<div class="card">
+        <div class="empty" style="padding-bottom:0">Noch keine Daten für ${cfg.label} vorhanden.</div>
+        ${cfg.uploadFormat === "pdf" ? `
+        <div class="dropzone" id="dropzoneEmpty">
+          <div class="icon">📄</div>
+          <div class="main">PDF(s) hier ablegen oder klicken zum Auswählen</div>
+          <div class="sub">Depotauszüge werden automatisch ausgelesen und gespeichert</div>
+          <input type="file" id="fileInputEmpty" accept="application/pdf" multiple>
+        </div>` : cfg.uploadFormat === "csv" ? `
+        <div class="dropzone" id="dropzoneEmpty">
+          <div class="icon">📊</div>
+          <div class="main">Transaktionsexport (CSV) hier ablegen oder klicken zum Auswählen</div>
+          <div class="sub">Positionen und Kontobewegungen werden automatisch daraus berechnet</div>
+          <input type="file" id="fileInputEmpty" accept=".csv,text/csv" multiple>
+        </div>` : ""}
+      </div>`;
+      const dzEmpty = document.getElementById("dropzoneEmpty");
+      const fiEmpty = document.getElementById("fileInputEmpty");
+      if (dzEmpty && fiEmpty) {
+        dzEmpty.addEventListener("click", () => fiEmpty.click());
+        fiEmpty.addEventListener("change", (e) => { handleFiles(e.target.files); fiEmpty.value = ""; });
+        ["dragenter", "dragover"].forEach((evt) => dzEmpty.addEventListener(evt, (e) => { e.preventDefault(); dzEmpty.classList.add("drag"); }));
+        ["dragleave", "drop"].forEach((evt) => dzEmpty.addEventListener(evt, (e) => { e.preventDefault(); dzEmpty.classList.remove("drag"); }));
+        dzEmpty.addEventListener("drop", (e) => { if (e.dataTransfer.files && e.dataTransfer.files.length) handleFiles(e.dataTransfer.files); });
+      }
       return;
     }
 
@@ -2746,11 +2896,13 @@
     // ---- Snapshot management rows (nicht relevant/nicht gerendert bei combined) ----
     const snapshotByIso = {};
     for (const s of realSnapshots) snapshotByIso[s.date] = s;
+    const snapYears = Array.from(new Set(isoDates.map((iso) => iso.slice(0, 4)))).sort().reverse();
     const mgmtRows = [...isoDates].reverse().map((iso) => {
       const snap = snapshotByIso[iso];
       if (!snap) return "";
       const total = snap.positions.reduce((s, p) => s + p.Kurswert, 0);
-      return `<tr>
+      const searchText = [isoToDisplay(iso), snap.source || ""].join(" ").toLowerCase();
+      return `<tr data-date="${iso}" data-search="${searchText.replace(/"/g, "&quot;")}">
         <td>${isoToDisplay(iso)}</td>
         <td class="num">${fmtEur(total)}</td>
         <td class="num">${snap.positions.length}</td>
@@ -2890,17 +3042,24 @@
 
       ${currentDepot !== "combined" ? `
       <div class="tab-panel" id="tab-data" style="display:${activeTab === "data" ? "block" : "none"}">
-        ${cfg.supportsPdfUpload ? `
+        ${cfg.uploadFormat === "pdf" ? `
         <div class="dropzone" id="dropzone">
           <div class="icon">📄</div>
           <div class="main">PDF(s) hier ablegen oder klicken zum Auswählen</div>
           <div class="sub">Neue Depotauszüge werden automatisch ausgelesen und gespeichert</div>
           <input type="file" id="fileInput" accept="application/pdf" multiple>
-        </div>` : `
+        </div>` : cfg.uploadFormat === "csv" ? `
+        <div class="dropzone" id="dropzone">
+          <div class="icon">📊</div>
+          <div class="main">Transaktionsexport (CSV) hier ablegen oder klicken zum Auswählen</div>
+          <div class="sub">Positionen und Kontobewegungen werden automatisch daraus berechnet und gespeichert</div>
+          <input type="file" id="fileInput" accept=".csv,text/csv" multiple>
+        </div>
+        <div class="note">Den Transaktionsexport (CSV, gesamte Historie) bekommst du in der Trade-Republic-App/-Website
+        über die Konto- bzw. Exportfunktion. Jeder Upload berechnet deinen aktuellen Bestand neu und ergänzt neue
+        Kontobewegungen – bereits erfasste werden dabei nicht doppelt angelegt.</div>` : `
         <div class="card">
-          <div class="note">Für ${cfg.label} gibt es keinen PDF-Upload – die Daten wurden einmalig aus deinem
-          Transaktionsexport importiert. Neuere Transaktionen kannst du mir als aktualisierten Export schicken,
-          oder Einzahlungen/Kurse unten manuell ergänzen.</div>
+          <div class="note">Für ${cfg.label} gibt es keinen Datei-Upload – Einzahlungen/Kurse unten manuell ergänzen.</div>
         </div>`}
 
         <div class="card">
@@ -2973,7 +3132,27 @@
 
         <div class="card">
           <h2>Gespeicherte Stichtage (${isoDates.length})</h2>
-          <div class="table-wrap"><table>
+          <div class="txn-filter-bar">
+            <div class="txn-filter-quick">
+              <select id="snapFilterYear" title="Jahr">
+                <option value="">Alle Jahre</option>
+                ${snapYears.map((y) => `<option value="${y}" ${snapFilterState.year === y ? "selected" : ""}>${y}</option>`).join("")}
+              </select>
+              <select id="snapFilterMonth" title="Monat">
+                <option value="">Alle Monate</option>
+                ${MONTH_NAMES.map((name, i) => { const mm = String(i + 1).padStart(2, "0"); return `<option value="${mm}" ${snapFilterState.month === mm ? "selected" : ""}>${name}</option>`; }).join("")}
+              </select>
+            </div>
+            <input type="text" id="snapSearch" placeholder="🔍 Suche (Quelle) …" value="${snapFilterState.query.replace(/"/g, "&quot;")}">
+            <div class="txn-filter-dates">
+              <input type="date" id="snapFilterFrom" value="${snapFilterState.from}" title="Von">
+              <span>–</span>
+              <input type="date" id="snapFilterTo" value="${snapFilterState.to}" title="Bis">
+            </div>
+            <button class="btn" id="snapFilterReset">Zurücksetzen</button>
+            <span id="snapFilterCount" class="sub-h2"></span>
+          </div>
+          <div class="table-wrap table-wrap-scroll"><table id="snapTable">
             <thead><tr><th>Stichtag</th><th class="num">Gesamtwert</th><th class="num">Positionen</th><th>Quelle</th><th></th></tr></thead>
             <tbody>${mgmtRows}</tbody>
           </table></div>
@@ -3168,6 +3347,62 @@
         renderDashboard();
       });
     });
+    // ---- Gespeicherte Stichtage filtern/durchsuchen (analog zur Buchungen-Filterleiste) ----
+    function applySnapFilter() {
+      const table = document.getElementById("snapTable");
+      if (!table) return;
+      const query = snapFilterState.query.toLowerCase().trim();
+      const from = snapFilterState.from;
+      const to = snapFilterState.to;
+      let visible = 0, total = 0;
+      table.querySelectorAll("tbody tr").forEach((row) => {
+        total++;
+        const date = row.getAttribute("data-date") || "";
+        const search = row.getAttribute("data-search") || "";
+        const match = (!query || search.includes(query)) && (!from || date >= from) && (!to || date <= to);
+        row.style.display = match ? "" : "none";
+        if (match) visible++;
+      });
+      const countEl = document.getElementById("snapFilterCount");
+      if (countEl) countEl.textContent = (query || from || to) ? `${visible} von ${total} Stichtagen` : `${total} Stichtag(e)`;
+    }
+    const snapSearchEl = document.getElementById("snapSearch");
+    const snapFilterFromEl = document.getElementById("snapFilterFrom");
+    const snapFilterToEl = document.getElementById("snapFilterTo");
+    const snapFilterResetEl = document.getElementById("snapFilterReset");
+    const snapFilterYearEl = document.getElementById("snapFilterYear");
+    const snapFilterMonthEl = document.getElementById("snapFilterMonth");
+    function applySnapYearMonthQuickFilter() {
+      const year = snapFilterYearEl.value;
+      const month = snapFilterMonthEl.value;
+      snapFilterState.year = year;
+      snapFilterState.month = month;
+      if (!year) {
+        snapFilterState.from = ""; snapFilterState.to = "";
+      } else if (!month) {
+        snapFilterState.from = `${year}-01-01`; snapFilterState.to = `${year}-12-31`;
+      } else {
+        const lastDay = new Date(Number(year), Number(month), 0).getDate();
+        snapFilterState.from = `${year}-${month}-01`; snapFilterState.to = `${year}-${month}-${String(lastDay).padStart(2, "0")}`;
+      }
+      snapFilterFromEl.value = snapFilterState.from; snapFilterToEl.value = snapFilterState.to;
+      applySnapFilter();
+    }
+    if (snapSearchEl) {
+      snapSearchEl.addEventListener("input", () => { snapFilterState.query = snapSearchEl.value; applySnapFilter(); });
+      snapFilterFromEl.addEventListener("change", () => { snapFilterState.from = snapFilterFromEl.value; snapFilterState.year = ""; snapFilterState.month = ""; snapFilterYearEl.value = ""; snapFilterMonthEl.value = ""; applySnapFilter(); });
+      snapFilterToEl.addEventListener("change", () => { snapFilterState.to = snapFilterToEl.value; snapFilterState.year = ""; snapFilterState.month = ""; snapFilterYearEl.value = ""; snapFilterMonthEl.value = ""; applySnapFilter(); });
+      snapFilterYearEl.addEventListener("change", applySnapYearMonthQuickFilter);
+      snapFilterMonthEl.addEventListener("change", applySnapYearMonthQuickFilter);
+      snapFilterResetEl.addEventListener("click", () => {
+        snapFilterState = { query: "", from: "", to: "", year: "", month: "" };
+        snapSearchEl.value = ""; snapFilterFromEl.value = ""; snapFilterToEl.value = "";
+        snapFilterYearEl.value = ""; snapFilterMonthEl.value = "";
+        applySnapFilter();
+      });
+      applySnapFilter();
+    }
+
     const resetBtn = document.getElementById("resetAll");
     if (resetBtn) {
       resetBtn.addEventListener("click", () => {
